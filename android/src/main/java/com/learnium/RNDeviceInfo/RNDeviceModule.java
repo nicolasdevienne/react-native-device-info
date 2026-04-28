@@ -3,6 +3,10 @@ package com.learnium.RNDeviceInfo;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.KeyguardManager;
+import android.bluetooth.BluetoothA2dp;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothHeadset;
+import android.bluetooth.BluetoothProfile;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -12,6 +16,8 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.FeatureInfo;
 import android.location.LocationManager;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
@@ -22,6 +28,8 @@ import android.os.Environment;
 import android.os.PowerManager;
 import android.os.StatFs;
 import android.os.BatteryManager;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Debug;
 import android.os.Process;
 import android.os.SystemClock;
@@ -85,6 +93,9 @@ public class RNDeviceModule extends ReactContextBaseJavaModule {
   private BroadcastReceiver headphoneBluetoothConnectionReceiver;
   private RNInstallReferrerClient installReferrerClient;
   private InputMethodManager inputMethodManager;
+  private AudioManager audioManager;
+  private AudioDeviceCallback headphoneAudioDeviceCallback;
+  private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
   private double mLastBatteryLevel = -1;
   private String mLastBatteryState = "";
@@ -153,48 +164,57 @@ public class RNDeviceModule extends ReactContextBaseJavaModule {
   }
 
   private void initializeHeadphoneConnectionReceivers() {
-    // 1. Filter for both wired headset and bluetooth headphones
-    IntentFilter filter = new IntentFilter();
-    filter.addAction(AudioManager.ACTION_HEADSET_PLUG);
-    filter.addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED);
+    audioManager = (AudioManager) getReactApplicationContext().getSystemService(Context.AUDIO_SERVICE);
 
-    headphoneConnectionReceiver = new BroadcastReceiver() {
-      @Override
-      public void onReceive(Context context, Intent intent) {
-        boolean isConnected = isHeadphonesConnectedSync();
-        sendEvent(getReactApplicationContext(), "RNDeviceInfo_headphoneConnectionDidChange", isConnected);
-      }
-    };
-
-    registerReceiver(getReactApplicationContext(), headphoneConnectionReceiver, filter);
-
-    // 2. Filter for wired headset
+    // Wired fallback broadcast
     IntentFilter filterWired = new IntentFilter();
     filterWired.addAction(AudioManager.ACTION_HEADSET_PLUG);
 
     headphoneWiredConnectionReceiver = new BroadcastReceiver() {
       @Override
       public void onReceive(Context context, Intent intent) {
-        boolean isConnected = isWiredHeadphonesConnectedSync();
-        sendEvent(getReactApplicationContext(), "RNDeviceInfo_headphoneWiredConnectionDidChange", isConnected);
+        emitHeadphoneState();
       }
     };
 
-    registerReceiver(getReactApplicationContext(), headphoneWiredConnectionReceiver, filter);
+    registerReceiver(getReactApplicationContext(), headphoneWiredConnectionReceiver, filterWired);
 
-    // 3. Filter for bluetooth headphones
-    IntentFilter filterBluetooth = new IntentFilter();
-    filterBluetooth.addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED);
+    // Fallback for route-loss / reroute events, often triggered when bluetooth audio disconnects
+    IntentFilter noisyFilter = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
 
-    headphoneBluetoothConnectionReceiver = new BroadcastReceiver() {
+    headphoneConnectionReceiver = new BroadcastReceiver() {
       @Override
       public void onReceive(Context context, Intent intent) {
-        boolean isConnected = isBluetoothHeadphonesConnectedSync();
-        sendEvent(getReactApplicationContext(), "RNDeviceInfo_headphoneBluetoothConnectionDidChange", isConnected);
+        emitHeadphoneState();
       }
     };
 
-    registerReceiver(getReactApplicationContext(), headphoneBluetoothConnectionReceiver, filter);
+    registerReceiver(getReactApplicationContext(), headphoneConnectionReceiver, noisyFilter);
+
+    // Main solution for API 23+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && audioManager != null) {
+      headphoneAudioDeviceCallback = new AudioDeviceCallback() {
+        @Override
+        public void onAudioDevicesAdded(AudioDeviceInfo[] addedDevices) {
+          emitHeadphoneStateDebounced();
+        }
+
+        @Override
+        public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
+          emitHeadphoneStateDebounced();
+        }
+      };
+
+      audioManager.registerAudioDeviceCallback(headphoneAudioDeviceCallback, null);
+    }
+  }
+
+  private boolean isHeadphonesConnectedFromIntent(Intent intent) {
+    return isHeadphonesConnectedSync();
+  }
+
+  private boolean isBluetoothHeadphonesConnectedFromIntent(Intent intent) {
+    return isBluetoothHeadphonesConnectedSync();
   }
 
   // the upstream method was removed in react-native 0.74
@@ -209,10 +229,37 @@ public class RNDeviceModule extends ReactContextBaseJavaModule {
   // react-native >= 0.74, which would cause linting errors across versions
   // once minimum supported react-native here is 0.74+, add the tag
   public void invalidate() {
-    getReactApplicationContext().unregisterReceiver(receiver);
-    getReactApplicationContext().unregisterReceiver(headphoneConnectionReceiver);
-    getReactApplicationContext().unregisterReceiver(headphoneWiredConnectionReceiver);
-    getReactApplicationContext().unregisterReceiver(headphoneBluetoothConnectionReceiver);
+    try {
+      getReactApplicationContext().unregisterReceiver(receiver);
+    } catch (Exception ignored) {}
+
+    try {
+      if (headphoneConnectionReceiver != null) {
+        getReactApplicationContext().unregisterReceiver(headphoneConnectionReceiver);
+      }
+    } catch (Exception ignored) {}
+
+    try {
+      if (headphoneWiredConnectionReceiver != null) {
+        getReactApplicationContext().unregisterReceiver(headphoneWiredConnectionReceiver);
+      }
+    } catch (Exception ignored) {}
+
+    try {
+      if (headphoneBluetoothConnectionReceiver != null) {
+        getReactApplicationContext().unregisterReceiver(headphoneBluetoothConnectionReceiver);
+      }
+    } catch (Exception ignored) {}
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+            && audioManager != null
+            && headphoneAudioDeviceCallback != null) {
+      try {
+        audioManager.unregisterAudioDeviceCallback(headphoneAudioDeviceCallback);
+      } catch (Exception ignored) {}
+    }
+
+    mainHandler.removeCallbacksAndMessages(null);
   }
 
 
@@ -685,24 +732,55 @@ public class RNDeviceModule extends ReactContextBaseJavaModule {
 
   @ReactMethod(isBlockingSynchronousMethod = true)
   public boolean isHeadphonesConnectedSync() {
-    AudioManager audioManager = (AudioManager)getReactApplicationContext().getSystemService(Context.AUDIO_SERVICE);
-    return audioManager.isWiredHeadsetOn() || audioManager.isBluetoothA2dpOn();
+    return isWiredHeadphonesConnectedSync() || isBluetoothHeadphonesConnectedSync();
   }
   @ReactMethod
   public void isHeadphonesConnected(Promise p) {p.resolve(isHeadphonesConnectedSync());}
 
   @ReactMethod(isBlockingSynchronousMethod = true)
   public boolean isWiredHeadphonesConnectedSync() {
-    AudioManager audioManager = (AudioManager)getReactApplicationContext().getSystemService(Context.AUDIO_SERVICE);
-    return audioManager.isWiredHeadsetOn();
+    AudioManager localAudioManager =
+            (AudioManager) getReactApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+
+    if (localAudioManager == null) {
+      return false;
+    }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      AudioDeviceInfo[] devices = localAudioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+      for (AudioDeviceInfo device : devices) {
+        if (isWiredOutputDevice(device.getType())) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    return localAudioManager.isWiredHeadsetOn();
   }
   @ReactMethod
   public void isWiredHeadphonesConnected(Promise p) {p.resolve(isWiredHeadphonesConnectedSync());}
 
   @ReactMethod(isBlockingSynchronousMethod = true)
   public boolean isBluetoothHeadphonesConnectedSync() {
-    AudioManager audioManager = (AudioManager)getReactApplicationContext().getSystemService(Context.AUDIO_SERVICE);
-    return audioManager.isBluetoothA2dpOn();
+    AudioManager localAudioManager =
+            (AudioManager) getReactApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+
+    if (localAudioManager == null) {
+      return false;
+    }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      AudioDeviceInfo[] devices = localAudioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+      for (AudioDeviceInfo device : devices) {
+        if (isBluetoothOutputDevice(device.getType())) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    return localAudioManager.isBluetoothA2dpOn() || localAudioManager.isBluetoothScoOn();
   }
   @ReactMethod
   public void isBluetoothHeadphonesConnected(Promise p) {p.resolve(isBluetoothHeadphonesConnectedSync());}
@@ -1138,26 +1216,26 @@ public class RNDeviceModule extends ReactContextBaseJavaModule {
       Object task = getAppSetIdInfoMethod.invoke(client);
 
       Class<?> onSuccessListenerClass =
-          Class.forName("com.google.android.gms.tasks.OnSuccessListener", true, loader);
+              Class.forName("com.google.android.gms.tasks.OnSuccessListener", true, loader);
       InvocationHandler successHandler =
-          (proxy, method, args) -> {
-            if ("onSuccess".equals(method.getName()) && args != null && args.length == 1) {
-              Object appSetIdInfo = args[0];
-              String id = (String) appSetIdInfo.getClass().getMethod("getId").invoke(appSetIdInfo);
-              Object scopeObj = appSetIdInfo.getClass().getMethod("getScope").invoke(appSetIdInfo);
-              int scope = scopeObj instanceof Number ? ((Number) scopeObj).intValue() : -1;
-              WritableMap result = Arguments.createMap();
-              result.putString("id", id != null ? id : "unknown");
-              result.putInt("scope", scope);
-              promise.resolve(result);
-            }
-            return null;
-          };
+              (proxy, method, args) -> {
+                if ("onSuccess".equals(method.getName()) && args != null && args.length == 1) {
+                  Object appSetIdInfo = args[0];
+                  String id = (String) appSetIdInfo.getClass().getMethod("getId").invoke(appSetIdInfo);
+                  Object scopeObj = appSetIdInfo.getClass().getMethod("getScope").invoke(appSetIdInfo);
+                  int scope = scopeObj instanceof Number ? ((Number) scopeObj).intValue() : -1;
+                  WritableMap result = Arguments.createMap();
+                  result.putString("id", id != null ? id : "unknown");
+                  result.putInt("scope", scope);
+                  promise.resolve(result);
+                }
+                return null;
+              };
       Object successListener =
-          Proxy.newProxyInstance(loader, new Class<?>[] {onSuccessListenerClass}, successHandler);
+              Proxy.newProxyInstance(loader, new Class<?>[] {onSuccessListenerClass}, successHandler);
 
       Class<?> onFailureListenerClass =
-          Class.forName("com.google.android.gms.tasks.OnFailureListener", true, loader);
+              Class.forName("com.google.android.gms.tasks.OnFailureListener", true, loader);
       InvocationHandler failureHandler =
           (proxy, method, args) -> {
             if ("onFailure".equals(method.getName()) && args != null && args.length == 1) {
@@ -1189,5 +1267,45 @@ public class RNDeviceModule extends ReactContextBaseJavaModule {
       result.putInt("scope", -1);
       promise.resolve(result);
     }
+  }
+
+  private void emitHeadphoneState() {
+    boolean wired = isWiredHeadphonesConnectedSync();
+    boolean bluetooth = isBluetoothHeadphonesConnectedSync();
+    boolean any = wired || bluetooth;
+
+    sendEvent(getReactApplicationContext(), "RNDeviceInfo_headphoneWiredConnectionDidChange", wired);
+    sendEvent(getReactApplicationContext(), "RNDeviceInfo_headphoneBluetoothConnectionDidChange", bluetooth);
+    sendEvent(getReactApplicationContext(), "RNDeviceInfo_headphoneConnectionDidChange", any);
+  }
+
+  private void emitHeadphoneStateDebounced() {
+    mainHandler.removeCallbacksAndMessages(null);
+    mainHandler.postDelayed(new Runnable() {
+      @Override
+      public void run() {
+        emitHeadphoneState();
+      }
+    }, 250);
+  }
+
+  private boolean isBluetoothOutputDevice(int type) {
+    if (type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+      return true;
+    }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      return type == AudioDeviceInfo.TYPE_BLE_HEADSET
+              || type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+              || type == AudioDeviceInfo.TYPE_BLE_BROADCAST;
+    }
+
+    return false;
+  }
+
+  private boolean isWiredOutputDevice(int type) {
+    return type == AudioDeviceInfo.TYPE_WIRED_HEADSET
+            || type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+            || type == AudioDeviceInfo.TYPE_USB_HEADSET;
   }
 }
